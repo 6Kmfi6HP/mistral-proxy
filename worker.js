@@ -111,7 +111,8 @@ export default {
     }
 
     // ---- 流式：把 Mistral SSE 翻译成 OpenAI SSE ----
-    return corsResponse(streamResponse(mistralResp, body.model));
+    const streamOptions = body.stream_options || {};
+    return corsResponse(streamResponse(mistralResp, body.model, streamOptions));
   },
 };
 
@@ -137,6 +138,7 @@ function translateRequest(body) {
   const completionArgs = {};
   if (body.temperature !== undefined) completionArgs.temperature = body.temperature;
   if (body.max_tokens !== undefined) completionArgs.max_tokens = body.max_tokens;
+  if (body.max_completion_tokens !== undefined) completionArgs.max_tokens = body.max_completion_tokens;
   if (body.top_p !== undefined) completionArgs.top_p = body.top_p;
   if (body.presence_penalty !== undefined) completionArgs.presence_penalty = body.presence_penalty;
   if (body.frequency_penalty !== undefined) completionArgs.frequency_penalty = body.frequency_penalty;
@@ -146,10 +148,13 @@ function translateRequest(body) {
   if (body.response_format !== undefined) completionArgs.response_format = body.response_format;
   if (body.prediction !== undefined) completionArgs.prediction = body.prediction;
   // Mistral Conversations API only accepts 'none' or 'high' for reasoning_effort.
-  // Map OpenAI values (none/low/medium/high/max) accordingly.
+  // Map OpenAI values (none/minimal/low/medium/high/max) accordingly:
+  //   none/minimal/low → 'none'
+  //   medium/high/max  → 'high'
   if (body.reasoning_effort !== undefined) {
     const re = String(body.reasoning_effort).toLowerCase();
-    completionArgs.reasoning_effort = (re === 'none' || re === 'low') ? 'none' : 'high';
+    const noneEfforts = ['none', 'minimal', 'low'];
+    completionArgs.reasoning_effort = noneEfforts.includes(re) ? 'none' : 'high';
   }
 
   // tool_choice: OpenAI "required" → Mistral "required"; "auto"/"none" same
@@ -160,8 +165,12 @@ function translateRequest(body) {
       // "auto" or "none" — Mistral supports these directly
       completionArgs.tool_choice = body.tool_choice;
     }
-    // If tool_choice is an object (specific function), we can't translate directly
-    // Mistral's tool_choice is an enum, so we default to "auto"
+    // If tool_choice is an object (specific function), Mistral Conversations API
+    // only supports string enums (auto/none/required), so fall back to 'required'
+    // (forces tool use, closest to specifying a specific function)
+    else if (typeof body.tool_choice === 'object') {
+      completionArgs.tool_choice = 'required';
+    }
   }
 
   // system 消息拆到 instructions；tool 消息转 function.result；
@@ -172,17 +181,30 @@ function translateRequest(body) {
   for (const m of body.messages) {
     if (!m || typeof m !== 'object') continue;
 
-    if (m.role === 'system') {
+    if (m.role === 'system' || m.role === 'developer') {
+      // OpenAI uses 'developer' as alias for 'system' in newer API versions
       const text = extractText(m.content);
       if (text) systemParts.push(text);
     } else if (m.role === 'user') {
       inputs.push({ role: 'user', content: translateContent(m.content) });
     } else if (m.role === 'assistant') {
       // assistant 文本内容（如果有）
+      // If assistant message has reasoning_content, convert to ThinkChunk for replay
+      // (Mistral docs: "always replay the full assistant message including ThinkChunk")
       const text = extractText(m.content);
-      if (text) {
-        const entry = { role: 'assistant', content: translateContent(m.content) };
+      const hasReasoning = m.reasoning_content || (Array.isArray(m.content) &&
+        m.content.some(p => p.type === 'thinking'));
+      if (text || hasReasoning) {
+        const contentChunks = Array.isArray(m.content) ? translateContent(m.content) : text;
+        const entry = { role: 'assistant', content: contentChunks };
         if (m.prefix) entry.prefix = true;
+        // If reasoning_content exists as a separate field, inject as ThinkChunk
+        if (m.reasoning_content && !Array.isArray(m.content)) {
+          entry.content = [
+            { type: 'thinking', thinking: [{ type: 'text', text: m.reasoning_content }], closed: true },
+            { type: 'text', text: text },
+          ];
+        }
         inputs.push(entry);
       }
       // assistant 的 tool_calls → function.call 条目
@@ -274,6 +296,16 @@ function translateContent(content) {
       // Could convert to base64 document_url if needed
     } else if (part.type === 'document_url') {
       chunks.push({ type: 'document_url', document_url: part.document_url, document_name: part.document_name });
+    } else if (part.type === 'thinking') {
+      // Preserve ThinkChunk for multi-turn reasoning replay
+      // Mistral docs: "always replay the full assistant message including ThinkChunk"
+      chunks.push(part);
+    } else if (part.type === 'tool_file') {
+      // Preserve ToolFileChunk (tool-generated files from previous turns)
+      chunks.push(part);
+    } else if (part.type === 'tool_reference') {
+      // Preserve ToolReferenceChunk from previous assistant outputs
+      chunks.push(part);
     } else {
       // Pass through unknown types
       chunks.push(part);
@@ -292,6 +324,21 @@ function extractText(content) {
     .map((part) => {
       if (typeof part === 'string') return part;
       if (part.type === 'thinking') return '';  // thinking handled separately
+      if (part.type === 'text') return part.text || '';
+      if (part.type === 'tool_reference') {
+        const title = part.title || part.tool;
+        return part.url ? `[${title}](${part.url})` : `[${title}]`;
+      }
+      if (part.type === 'tool_file') {
+        return `[File: ${part.file_name || part.file_id}]`;
+      }
+      if (part.type === 'image_url') {
+        const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url || '';
+        return url ? `![image](${url})` : '[image]';
+      }
+      if (part.type === 'document_url') {
+        return `[Document: ${part.document_name || part.document_url}]`;
+      }
       return part.text || '';
     })
     .filter(Boolean)
@@ -317,6 +364,21 @@ function extractThinking(content) {
 //  工具翻译：OpenAI tools → Mistral tools
 //  OpenAI function tools format is compatible with Mistral FunctionTool
 // ============================================================
+// Recursively clean JSON Schema for Mistral compatibility.
+// Removes $id, $schema, and additionalProperties:false that cause validation errors.
+// Based on LiteLLM's _clean_tool_schema_for_mistral pattern.
+function cleanToolSchema(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(cleanToolSchema);
+  const cleaned = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === '$id' || key === '$schema') continue;
+    if (key === 'additionalProperties' && value === false) continue;
+    cleaned[key] = typeof value === 'object' && value !== null ? cleanToolSchema(value) : value;
+  }
+  return cleaned;
+}
+
 function translateTools(tools) {
   if (!Array.isArray(tools)) return [];
 
@@ -326,17 +388,20 @@ function translateTools(tools) {
 
     if (tool.type === 'function' && tool.function) {
       // OpenAI function tool → Mistral FunctionTool (same format)
+      // Clean schema: remove $id, $schema that cause validation errors (LiteLLM pattern)
+      const params = cleanToolSchema(tool.function.parameters || tool.function.schema || {});
       const fn = {
         type: 'function',
         function: {
           name: tool.function.name,
-          parameters: tool.function.parameters || tool.function.schema || {},
+          parameters: params,
         },
       };
       if (tool.function.description) fn.function.description = tool.function.description;
       if (tool.function.strict !== undefined) fn.function.strict = tool.function.strict;
       result.push(fn);
-    } else if (tool.type === 'web_search') {
+    } else if (tool.type === 'web_search' || tool.type === 'web_search_preview') {
+      // OpenAI's web_search_preview maps to Mistral's web_search
       result.push({ type: 'web_search' });
     } else if (tool.type === 'web_search_premium') {
       result.push({ type: 'web_search_premium' });
@@ -391,6 +456,11 @@ function translateResponse(convData, model) {
     if (toolText) toolResultParts.push(toolText);
   }
 
+  // Append agent handoff info as readable text (consistent with streaming behavior)
+  for (const ho of agentHandoffs) {
+    toolResultParts.push(`[Handed off from ${ho.previous_agent_name} to ${ho.next_agent_name}]`);
+  }
+
   const allText = [...textParts, ...toolResultParts].join('\n\n');
   if (allText) {
     message.content = allText;
@@ -441,6 +511,14 @@ function translateResponse(convData, model) {
     completion_tokens: usage.completion_tokens || 0,
     total_tokens: usage.total_tokens || 0,
   };
+  // Include Mistral-specific connector token usage as extension fields
+  // (OpenAI clients will ignore unknown fields; Mistral-aware clients can use them)
+  if (usage.connector_tokens !== undefined && usage.connector_tokens !== null) {
+    openaiUsage.connector_tokens = usage.connector_tokens;
+  }
+  if (usage.connectors !== undefined && usage.connectors !== null) {
+    openaiUsage.connectors = usage.connectors;
+  }
 
   return {
     id: convData.conversation_id || `chatcmpl-${Date.now()}`,
@@ -462,11 +540,20 @@ function translateResponse(convData, model) {
 function formatToolExecutionResult(name, info, argumentsStr) {
   // Web search results
   if (name === 'web_search' || name === 'web_search_premium') {
-    const results = info.results || [];
+    // API returns info.result (singular, JSON string) or info.results (array)
+    let results = info.results || [];
+    if (!results.length && info.result) {
+      // Parse the result JSON string: {"id": {url, title, description, snippets}, ...}
+      try {
+        const parsed = typeof info.result === 'string' ? JSON.parse(info.result) : info.result;
+        results = Object.values(parsed);
+      } catch { results = []; }
+    }
     if (results.length > 0) {
       const formatted = results.map((r) => {
         let s = `[${r.title || 'Untitled'}](${r.url || ''})`;
-        if (r.content) s += `: ${r.content}`;
+        if (r.description) s += `: ${r.description}`;
+        else if (r.content) s += `: ${r.content}`;
         return s;
       });
       return `Web Search Results:\n${formatted.join('\n')}`;
@@ -508,7 +595,7 @@ function formatToolExecutionResult(name, info, argumentsStr) {
 // ============================================================
 //  流式翻译：Mistral SSE → OpenAI SSE
 // ============================================================
-function streamResponse(mistralResp, model) {
+function streamResponse(mistralResp, model, streamOptions = {}) {
   const encoder = new TextEncoder();
   const reader = mistralResp.body.getReader();
   const decoder = new TextDecoder();
@@ -577,7 +664,15 @@ function streamResponse(mistralResp, model) {
               if (chunk.type === 'text' && chunk.text) {
                 contentText += chunk.text;
               } else if (chunk.type === 'tool_reference') {
-                contentText += `[${chunk.title || chunk.tool}]`;
+                const title = chunk.title || chunk.tool;
+                contentText += chunk.url ? `[${title}](${chunk.url})` : `[${title}]`;
+              } else if (chunk.type === 'tool_file') {
+                contentText += `[File: ${chunk.file_name || chunk.file_id}]`;
+              } else if (chunk.type === 'image_url') {
+                const imgUrl = typeof chunk.image_url === 'string' ? chunk.image_url : chunk.image_url?.url || '';
+                contentText += imgUrl ? `![image](${imgUrl})` : '[image]';
+              } else if (chunk.type === 'document_url') {
+                contentText += `[Document: ${chunk.document_name || chunk.document_url}]`;
               } else if (chunk.type === 'thinking' && Array.isArray(chunk.thinking)) {
                 // Emit thinking content as reasoning_content deltas
                 for (const t of chunk.thinking) {
@@ -720,14 +815,20 @@ function streamResponse(mistralResp, model) {
           });
         } else if (eventType === 'conversation.response.done') {
           const finishReason = hasFunctionCall ? 'tool_calls' : 'stop';
-          emit({
+          // Respect stream_options.include_usage (default: true for compatibility)
+          // When false, OpenAI clients don't expect usage in the final chunk
+          const includeUsage = streamOptions.include_usage !== false;
+          const doneChunk = {
             id: conversationId,
             object: 'chat.completion.chunk',
             created: data.created_at ? Math.floor(new Date(data.created_at).getTime() / 1000) : createdAt,
             model: streamingModel,
             choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-            usage: data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-          });
+          };
+          if (includeUsage) {
+            doneChunk.usage = data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+          }
+          emit(doneChunk);
         }
       };
 
