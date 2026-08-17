@@ -145,7 +145,12 @@ function translateRequest(body) {
   if (body.seed !== undefined) completionArgs.random_seed = body.seed;
   if (body.response_format !== undefined) completionArgs.response_format = body.response_format;
   if (body.prediction !== undefined) completionArgs.prediction = body.prediction;
-  if (body.reasoning_effort !== undefined) completionArgs.reasoning_effort = body.reasoning_effort;
+  // Mistral Conversations API only accepts 'none' or 'high' for reasoning_effort.
+  // Map OpenAI values (none/low/medium/high/max) accordingly.
+  if (body.reasoning_effort !== undefined) {
+    const re = String(body.reasoning_effort).toLowerCase();
+    completionArgs.reasoning_effort = (re === 'none' || re === 'low') ? 'none' : 'high';
+  }
 
   // tool_choice: OpenAI "required" → Mistral "required"; "auto"/"none" same
   if (body.tool_choice !== undefined) {
