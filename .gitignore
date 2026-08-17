@@ -1,0 +1,8 @@
+# 环境变量（含敏感凭据，切勿提交）
+.env
+
+# 依赖
+node_modules
+
+# Wrangler 本地缓存
+.wrangler

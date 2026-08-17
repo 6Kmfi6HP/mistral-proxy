@@ -1,0 +1,24 @@
+{
+  "name": "mistral-proxy",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker proxy that translates OpenAI chat/completions requests to Mistral conversations API, bypassing rate limits",
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail mistral-proxy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "mistral",
+    "proxy",
+    "openai",
+    "translation"
+  ],
+  "author": "",
+  "license": "MIT"
+}
