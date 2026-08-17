@@ -289,9 +289,28 @@ function extractText(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   return content
-    .map((part) => (typeof part === 'string' ? part : part.text || ''))
+    .map((part) => {
+      if (typeof part === 'string') return part;
+      if (part.type === 'thinking') return '';  // thinking handled separately
+      return part.text || '';
+    })
     .filter(Boolean)
     .join('');
+}
+
+// Extract thinking/reasoning content from Mistral message.output content array.
+// Thinking items have shape: { type: 'thinking', thinking: [{ type: 'text', text: '...' }] }
+function extractThinking(content) {
+  if (!Array.isArray(content)) return '';
+  const parts = [];
+  for (const part of content) {
+    if (part && part.type === 'thinking' && Array.isArray(part.thinking)) {
+      for (const t of part.thinking) {
+        if (t.text) parts.push(t.text);
+      }
+    }
+  }
+  return parts.join('\n');
 }
 
 // ============================================================
@@ -353,9 +372,12 @@ function translateResponse(convData, model) {
 
   // Concatenate all message.output text content
   const textParts = [];
+  const thinkingParts = [];
   for (const mo of messageOutputs) {
     const text = extractText(mo.content);
     if (text) textParts.push(text);
+    const thinking = extractThinking(mo.content);
+    if (thinking) thinkingParts.push(thinking);
   }
 
   // Also extract text from tool execution results (web_search, code_interpreter)
@@ -372,6 +394,11 @@ function translateResponse(convData, model) {
   const allText = [...textParts, ...toolResultParts].join('\n\n');
   if (allText) {
     message.content = allText;
+  }
+
+  // Include thinking/reasoning content (OpenAI reasoning_content format)
+  if (thinkingParts.length > 0) {
+    message.reasoning_content = thinkingParts.join('\n');
   }
 
   // 工具调用
@@ -538,19 +565,36 @@ function streamResponse(mistralResp, model) {
           // Update model if available
           if (data.model) streamingModel = data.model;
 
-          // Handle content that could be string or content chunks
+          // Handle content that could be string, array, or single object
           let contentText = '';
+          let contentArr = [];
           if (typeof data.content === 'string') {
             contentText = data.content;
-          } else if (Array.isArray(data.content)) {
-            // Content chunks: extract text from text chunks, format others
-            for (const chunk of data.content) {
+          } else {
+            // Normalize to array: single object → [object]
+            contentArr = Array.isArray(data.content) ? data.content : [data.content];
+            for (const chunk of contentArr) {
               if (chunk.type === 'text' && chunk.text) {
                 contentText += chunk.text;
               } else if (chunk.type === 'tool_reference') {
                 contentText += `[${chunk.title || chunk.tool}]`;
-              } else if (chunk.type === 'thinking' && chunk.thinking) {
-                // Skip thinking content in stream (or could include as separate content)
+              } else if (chunk.type === 'thinking' && Array.isArray(chunk.thinking)) {
+                // Emit thinking content as reasoning_content deltas
+                for (const t of chunk.thinking) {
+                  if (t.text) {
+                    emit({
+                      id: conversationId || `chatcmpl-${Date.now()}`,
+                      object: 'chat.completion.chunk',
+                      created: data.created_at ? Math.floor(new Date(data.created_at).getTime() / 1000) : createdAt,
+                      model: streamingModel,
+                      choices: [{
+                        index: data.output_index ?? 0,
+                        delta: { reasoning_content: t.text },
+                        finish_reason: null,
+                      }],
+                    });
+                  }
+                }
               }
             }
           }
